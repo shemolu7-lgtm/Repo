@@ -7,7 +7,6 @@ somewhere below the current directory, home directory, or common book paths.
 from __future__ import annotations
 
 import math
-import os
 import sys
 import time
 from dataclasses import dataclass
@@ -91,7 +90,7 @@ class Engine:
     def key(self, board: chess.Board) -> int:
         return chess.polyglot.zobrist_hash(board)
 
-    def evaluate(self, board: chess.Board) -> int:
+    def evaluate_white(self, board: chess.Board) -> int:
         if board.is_checkmate():
             return -MATE if board.turn == chess.WHITE else MATE
         if board.is_stalemate() or board.is_insufficient_material() or board.can_claim_draw():
@@ -108,7 +107,12 @@ class Engine:
         score += self.pawn_structure(board)
         score += self.king_safety(board)
         score += self.mobility(board)
+        score += self.positional_terms(board)
         return int(score)
+
+    def evaluate_stm(self, board: chess.Board) -> int:
+        score = self.evaluate_white(board)
+        return score if board.turn == chess.WHITE else -score
 
     def pawn_structure(self, board: chess.Board) -> int:
         score = 0
@@ -148,6 +152,35 @@ class Engine:
         board.turn = turn
         return 2 * (wm - bm)
 
+
+    def positional_terms(self, board: chess.Board) -> int:
+        """Extra Sunfish-strength positional features, returned from White's view."""
+        score = 0
+        for color, sign in [(chess.WHITE, 1), (chess.BLACK, -1)]:
+            bishops = len(board.pieces(chess.BISHOP, color))
+            if bishops >= 2:
+                score += sign * 35
+            enemy_pawns = board.pieces(chess.PAWN, not color)
+            own_pawns = board.pieces(chess.PAWN, color)
+            for sq in own_pawns:
+                f, r = chess.square_file(sq), chess.square_rank(sq)
+                ahead = range(r + 1, 8) if color == chess.WHITE else range(r - 1, -1, -1)
+                if not any(chess.square(ff, rr) in enemy_pawns for ff in range(max(0, f - 1), min(7, f + 1) + 1) for rr in ahead):
+                    bonus_rank = r if color == chess.WHITE else 7 - r
+                    score += sign * (8 + bonus_rank * bonus_rank)
+            for rook in board.pieces(chess.ROOK, color):
+                f = chess.square_file(rook)
+                own_on_file = any(chess.square(f, rr) in own_pawns for rr in range(8))
+                enemy_on_file = any(chess.square(f, rr) in enemy_pawns for rr in range(8))
+                if not own_on_file and not enemy_on_file:
+                    score += sign * 18
+                elif not own_on_file:
+                    score += sign * 10
+            for pt, weight in [(chess.KNIGHT, 4), (chess.BISHOP, 4), (chess.ROOK, 2), (chess.QUEEN, 1)]:
+                for sq in board.pieces(pt, color):
+                    score += sign * weight * len(board.attacks(sq))
+        return score
+
     def see(self, board: chess.Board, move: chess.Move) -> int:
         victim = board.piece_at(move.to_square)
         attacker = board.piece_at(move.from_square)
@@ -173,7 +206,7 @@ class Engine:
         info = SearchInfo(start=time.time(), limit=seconds)
         book_move = self.book_move(board)
         if book_move:
-            info.best = book_move; info.score = self.evaluate(board); return info
+            info.best = book_move; info.score = self.evaluate_white(board); return info
         alpha, beta, last = -INF, INF, 0
         depth = 1
         while time.time() - info.start < seconds and depth <= 64:
@@ -187,7 +220,7 @@ class Engine:
                 elif score >= beta:
                     beta += window; window *= 2
                 else:
-                    last = score; info.best = move; info.score = score; info.depth = depth; break
+                    last = score; info.best = move; info.score = (score if board.turn == chess.WHITE else -score); info.depth = depth; break
             if info.stop: break
             depth += 1
         return info
@@ -205,7 +238,7 @@ class Engine:
             if entry.flag == 0: return entry.score, entry.move
             if entry.flag == 1 and entry.score >= beta: return entry.score, entry.move
             if entry.flag == -1 and entry.score <= alpha: return entry.score, entry.move
-        static = self.evaluate(board)
+        static = self.evaluate_stm(board)
         if not in_check and depth <= 3 and static - 90 * depth >= beta:
             return static, None
         if not in_check and depth >= 3 and abs(static) < MATE // 2:
@@ -249,13 +282,18 @@ class Engine:
 
     def qsearch(self, board: chess.Board, alpha: int, beta: int, ply: int, info: SearchInfo) -> int:
         info.qnodes += 1
-        stand = self.evaluate(board)
-        if stand >= beta: return beta
-        if alpha < stand: alpha = stand
-        caps = [m for m in board.legal_moves if board.is_capture(m) or m.promotion]
+        if board.is_check():
+            stand = -INF
+            caps = list(board.legal_moves)
+        else:
+            stand = self.evaluate_stm(board)
+            if stand >= beta: return beta
+            if alpha < stand: alpha = stand
+            caps = [m for m in board.legal_moves if board.is_capture(m) or m.promotion]
         caps.sort(key=lambda m: self.move_score(board, m, ply, None), reverse=True)
         for move in caps:
-            if self.see(board, move) < -80: continue
+            if not board.is_check() and self.see(board, move) < -80:
+                continue
             board.push(move)
             score = -self.qsearch(board, -beta, -alpha, ply + 1, info)
             board.pop()
@@ -331,7 +369,8 @@ def uci() -> None:
                 rem = int(parts[parts.index('wtime' if board.turn == chess.WHITE else 'btime') + 1]) / 1000
                 mt = max(0.05, rem / 30)
             info = engine.go(board, mt); nodes = info.nodes + info.qnodes
-            print(f"info depth {info.depth} seldepth {info.seldepth} score cp {info.score} nodes {nodes} nps {int(nodes/max(1e-6,time.time()-info.start))}")
+            uci_score = info.score if board.turn == chess.WHITE else -info.score
+            print(f"info depth {info.depth} seldepth {info.seldepth} score cp {uci_score} nodes {nodes} nps {int(nodes/max(1e-6,time.time()-info.start))}")
             print('bestmove', (info.best or next(iter(board.legal_moves))).uci())
         elif cmd == 'quit': break
         sys.stdout.flush()
